@@ -7,149 +7,104 @@ import numpy as np
 import json
 from pathlib import Path
 
-# Intentar importar geopy de forma segura
-try:
-    from geopy.geocoders import Nominatim
-    GEOPY_AVAILABLE = True
-except ImportError:
-    GEOPY_AVAILABLE = False
-
-# 1. Configuración de la página
+# Configuración de página - DEBE SER LA PRIMERA LÍNEA DE STREAMLIT
 st.set_page_config(page_title="EcoBici Pro CDMX", layout="wide")
 
-# --- FUNCIONES DE SOPORTE ---
-def calcular_distancia(lat1, lon1, lat2, lon2):
-    R = 6371  # Radio de la Tierra en km
-    dlat = np.radians(lat2 - lat1)
-    dlon = np.radians(lon2 - lon1)
-    a = np.sin(dlat/2)**2 + np.cos(np.radians(lat1)) * np.cos(np.radians(lat2)) * np.sin(dlon/2)**2
-    c = 2 * np.arctan2(np.sqrt(a), np.sqrt(1-a))
-    return R * c
+# --- CARGA SEGURA DE GEOPY ---
+try:
+    from geopy.geocoders import Nominatim
+    geolocator = Nominatim(user_agent="ecobici_analytics_cdmx")
+    GEOPY_READY = True
+except Exception:
+    GEOPY_READY = False
 
-@st.cache_data(ttl=60)
-def cargar_datos_ecobici():
+# --- FUNCIONES ---
+def calcular_distancia(lat1, lon1, lat2, lon2):
+    R = 6371
+    dlat, dlon = np.radians(lat2 - lat1), np.radians(lon2 - lon1)
+    a = np.sin(dlat/2)**2 + np.cos(np.radians(lat1)) * np.cos(np.radians(lat2)) * np.sin(dlon/2)**2
+    return R * 2 * np.arctan2(np.sqrt(a), np.sqrt(1-a))
+
+@st.cache_data(ttl=300) # Caché de 5 minutos
+def cargar_datos():
     try:
-        url_info = "https://gbfs.mex.lyftbikes.com/gbfs/en/station_information.json"
-        url_status = "https://gbfs.mex.lyftbikes.com/gbfs/en/station_status.json"
-        r1 = requests.get(url_info).json()
-        r2 = requests.get(url_status).json()
-        df1 = pd.DataFrame(r1['data']['stations'])
-        df2 = pd.DataFrame(r2['data']['stations'])
-        df = pd.merge(df1[['station_id', 'name', 'lat', 'lon', 'capacity']],
-                      df2[['station_id', 'num_bikes_available', 'num_docks_available']], on='station_id')
+        r1 = requests.get("https://gbfs.mex.lyftbikes.com/gbfs/en/station_information.json").json()
+        r2 = requests.get("https://gbfs.mex.lyftbikes.com/gbfs/en/station_status.json").json()
+        df1 = pd.DataFrame(r1['data']['stations'])[['station_id', 'name', 'lat', 'lon', 'capacity']]
+        df2 = pd.DataFrame(r2['data']['stations'])[['station_id', 'num_bikes_available', 'num_docks_available']]
+        df = pd.merge(df1, df2, on='station_id')
         df.columns = ['ID', 'Nombre', 'Lat', 'Lon', 'Capacidad', 'Bicis', 'Anclajes']
-        df['Disponibilidad_%'] = (df['Bicis'] / df['Capacidad'].replace(0, 1) * 100).round(1)
+        df['Disponibilidad_%'] = (df['Bicis'] / df['Capacidad'].replace(0, 1) * 100).clip(0, 100).round(1)
         return df
-    except Exception as e:
-        st.error(f"Error al conectar con la API de EcoBici: {e}")
+    except:
         return pd.DataFrame()
 
-def cargar_geojson():
-    # Buscamos el archivo en la misma carpeta que app.py usando Path
-    ruta_geojson = Path(__file__).parent / "09-Cdmx.geojson"
-    if ruta_geojson.exists():
-        try:
-            with open(ruta_geojson, "r", encoding="utf-8") as f:
-                return json.load(f)
-        except:
-            return None
+def cargar_capa_geojson():
+    ruta = Path(__file__).parent / "09-Cdmx.geojson"
+    if ruta.exists():
+        with open(ruta, "r", encoding="utf-8") as f:
+            return json.load(f)
     return None
 
-# --- CARGA DE DATOS ---
-st.write("# 🚲 EcoBici Pro: Navegador de Ciudad")
-st.caption("Visualización Avanzada | Luciano Salto")
+# --- UI ---
+st.title("🚲 EcoBici Pro CDMX")
+st.caption("Dashboard de Movilidad | Luciano Salto")
 
-df = cargar_datos_ecobici()
-geojson_data = cargar_geojson()
+df = cargar_datos()
+geojson = cargar_capa_geojson()
 
 if df.empty:
-    st.warning("No se pudieron cargar los datos de las estaciones.")
+    st.error("Error al cargar datos de la API.")
     st.stop()
 
-# --- SIDEBAR: CONTROLES ---
-st.sidebar.header("🛠️ Panel de Control")
+# --- SIDEBAR ---
+with st.sidebar:
+    st.header("Configuración")
+    modo = st.radio("Modo:", ["Global", "Dirección"])
+    id_sel = st.selectbox("Resaltar ID:", ["Ninguna"] + sorted(df['ID'].tolist(), key=int))
+    zoom = st.slider("Zoom", 10.0, 18.0, 12.0)
+    
+    ref_lat, ref_lon = 19.4298, -99.1676
+    if modo == "Dirección" and GEOPY_READY:
+        dir_input = st.text_input("Buscar dirección:", "Reforma 222")
+        loc = geolocator.geocode(dir_input + ", CDMX")
+        if loc:
+            ref_lat, ref_lon = loc.latitude, loc.longitude
+            st.success("Ubicación fijada")
 
-modo_vista = st.sidebar.radio("Modo de búsqueda:", ["Ver Todo el Sistema", "Buscar por Dirección (1.5km)"])
-id_seleccionada = st.sidebar.selectbox("Resaltar Estación por ID:", ["Ninguna"] + sorted(df['ID'].unique().tolist(), key=int))
-zoom_level = st.sidebar.slider("Nivel de Zoom:", 10.0, 18.0, 12.5)
-
-# --- LÓGICA DE GEOPROCESAMIENTO ---
-ref_lat, ref_lon = 19.4298, -99.1676  # Coordenadas por defecto (Ángel de la Independencia)
-
-if modo_vista == "Buscar por Dirección (1.5km)":
-    if not GEOPY_AVAILABLE:
-        st.sidebar.error("Librería 'geopy' no instalada. Revisa requirements.txt")
-    else:
-        direccion = st.sidebar.text_input("Escribe una dirección en CDMX:", "Palacio de Bellas Artes")
-        if direccion:
-            try:
-                geolocator = Nominatim(user_agent="ecobici_app_luciano")
-                location = geolocator.geocode(direccion + ", Ciudad de México")
-                if location:
-                    ref_lat, ref_lon = location.latitude, location.longitude
-                    st.sidebar.success("Ubicación encontrada")
-                else:
-                    st.sidebar.error("No se encontró la dirección.")
-            except:
-                st.sidebar.warning("Servicio de búsqueda saturado, intenta de nuevo.")
-
-    # Calcular distancia y filtrar
-    df['Distancia_Km'] = df.apply(lambda row: calcular_distancia(ref_lat, ref_lon, row['Lat'], row['Lon']), axis=1)
-    df_mapa = df[df['Distancia_Km'] <= 1.5].sort_values('Distancia_Km')
+# --- PROCESAMIENTO ---
+if modo == "Dirección":
+    df['Dist'] = calcular_distancia(ref_lat, ref_lon, df['Lat'], df['Lon'])
+    df_mapa = df[df['Dist'] <= 1.5].copy()
 else:
-    df_mapa = df
+    df_mapa = df.copy()
 
-# --- CREACIÓN DEL MAPA ---
+# --- MAPA ---
 fig = px.scatter_mapbox(
-    df_mapa, lat="Lat", lon="Lon", 
-    color="Disponibilidad_%", size="Capacidad",
-    hover_name="Nombre",
-    hover_data={"ID": True, "Bicis": True, "Anclajes": True, "Lat": False, "Lon": False},
-    color_continuous_scale="RdYlGn", range_color=[0, 100],
-    zoom=zoom_level, height=650
+    df_mapa, lat="Lat", lon="Lon", color="Disponibilidad_%", size="Capacidad",
+    hover_name="Nombre", color_continuous_scale="RdYlGn", range_color=[0, 100],
+    zoom=zoom, center={"lat": ref_lat, "lon": ref_lon}, height=600
 )
 
-# Añadir capa GeoJSON de CDMX
-if geojson_data:
-    fig.update_layout(
-        mapbox_layers=[{
-            "sourcetype": "geojson",
-            "source": geojson_data,
-            "type": "fill",
-            "color": "rgba(128, 128, 128, 0.2)",
-            "below": "traces"
-        }]
-    )
+if geojson:
+    fig.update_layout(mapbox_layers=[{
+        "sourcetype": "geojson", "source": geojson, "type": "line",
+        "color": "rgba(100,100,100,0.5)", "width": 1
+    }])
 
-# Resaltar estación seleccionada (Diamante Dorado)
-if id_seleccionada != "Ninguna":
-    sel = df[df['ID'] == id_seleccionada]
-    if not sel.empty:
-        fig.add_trace(go.Scattermapbox(
-            lat=sel["Lat"], lon=sel["Lon"], mode='markers',
-            marker=go.scattermapbox.Marker(size=25, color='gold', symbol='diamond'),
-            name="Seleccionada"
-        ))
+if id_sel != "Ninguna":
+    s = df[df['ID'] == id_sel]
+    fig.add_trace(go.Scattermapbox(lat=s["Lat"], lon=s["Lon"], mode='markers',
+                  marker=go.scattermapbox.Marker(size=20, color='gold', symbol='diamond')))
 
-# Marcador de punto de origen si se busca por dirección
-if modo_vista == "Buscar por Dirección (1.5km)":
-    fig.add_trace(go.Scattermapbox(
-        lat=[ref_lat], lon=[ref_lon], mode='markers',
-        marker=go.scattermapbox.Marker(size=20, color='dodgerblue', symbol='circle'),
-        name="Tu Punto"
-    ))
-
-# Configuración estética final
 fig.update_layout(mapbox_style="carto-positron", margin={"r":0,"t":0,"l":0,"b":0})
 st.plotly_chart(fig, use_container_width=True)
 
-# --- BOTÓN DE RUTA Y MÉTRICAS ---
-if modo_vista == "Buscar por Dirección (1.5km)" and not df_mapa.empty:
-    mejor = df_mapa.iloc[0]
-    st.info(f"📍 Estación más cercana: **{mejor['Nombre']}** a {mejor['Distancia_Km']:.2f} km")
-    url_gmaps = f"https://www.google.com/maps/dir/?api=1&origin={ref_lat},{ref_lon}&destination={mejor['Lat']},{mejor['Lon']}&travelmode=walking"
-    st.link_button("🗺️ Ver ruta caminando en Google Maps", url_gmaps)
+# --- GOOGLE MAPS ---
+if modo == "Dirección" and not df_mapa.empty:
+    m = df_mapa.sort_values('Dist').iloc[0]
+    url = f"https://www.google.com/maps/dir/?api=1&origin={ref_lat},{ref_lon}&destination={m['Lat']},{m['Lon']}&travelmode=walking"
+    st.link_button(f"Ir a {m['Nombre']} ({m['Dist']:.2f} km)", url)
 
-# --- TABLA DE DATOS ---
-with st.expander("📊 Ver listado detallado de estaciones"):
-    st.dataframe(df_mapa.sort_values(by="ID"), use_container_width=True, hide_index=True)
+with st.expander("Tabla"):
+    st.dataframe(df_mapa)
