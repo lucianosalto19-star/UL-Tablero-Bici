@@ -3,111 +3,96 @@ import pandas as pd
 import requests
 import plotly.express as px
 import plotly.graph_objects as go
+import numpy as np
 
-# Configuración de la página
-st.set_page_config(page_title="Tablero EcoBici", layout="wide")
+# Configuración inicial
+st.set_page_config(page_title="EcoBici Explorer", layout="wide")
 
-st.write("# Tablero EcoBici")
-st.caption("Visualización y Storytelling Usando Datos | Luciano Salto")
+# --- LÓGICA MATEMÁTICA PARA RADIO ---
+def calcular_distancia(lat1, lon1, lat2, lon2):
+    # Fórmula de Haversine para distancia entre coordenadas
+    R = 6371  # Radio de la Tierra en km
+    dlat = np.radians(lat2 - lat1)
+    dlon = np.radians(lon2 - lon1)
+    a = np.sin(dlat/2)**2 + np.cos(np.radians(lat1)) * np.cos(np.radians(lat2)) * np.sin(dlon/2)**2
+    c = 2 * np.arctan2(np.sqrt(a), np.sqrt(1-a))
+    return R * c
 
-# --- CARGA DE DATOS ---
+# --- CARGA DE DATOS (Mantenemos la función anterior) ---
 @st.cache_data(ttl=60)
 def cargar_datos_ecobici():
     url_info = "https://gbfs.mex.lyftbikes.com/gbfs/en/station_information.json"
     url_status = "https://gbfs.mex.lyftbikes.com/gbfs/en/station_status.json"
-    
-    resp_info = requests.get(url_info).json()
-    df_info = pd.DataFrame(resp_info['data']['stations'])
-    
-    resp_status = requests.get(url_status).json()
-    df_status = pd.DataFrame(resp_status['data']['stations'])
-    
-    df = pd.merge(
-        df_info[['station_id', 'name', 'lat', 'lon', 'capacity']],
-        df_status[['station_id', 'num_bikes_available', 'num_docks_available']],
-        on='station_id'
-    )
-    
-    df.columns = ['ID', 'Nombre', 'Latitud', 'Longitud', 'Capacidad', 'Bicis', 'Anclajes']
-    
-    # Cálculo de disponibilidad normalizada (0 a 100%)
-    # Evitamos división por cero si la capacidad es 0
+    r1 = requests.get(url_info).json()
+    r2 = requests.get(url_status).json()
+    df1 = pd.DataFrame(r1['data']['stations'])
+    df2 = pd.DataFrame(r2['data']['stations'])
+    df = pd.merge(df1[['station_id', 'name', 'lat', 'lon', 'capacity']],
+                  df2[['station_id', 'num_bikes_available', 'num_docks_available']], on='station_id')
+    df.columns = ['ID', 'Nombre', 'Lat', 'Lon', 'Capacidad', 'Bicis', 'Anclajes']
     df['Disponibilidad_%'] = (df['Bicis'] / df['Capacidad'].replace(0, 1) * 100).round(1)
-    
     return df
 
-with st.spinner('Actualizando datos en tiempo real...'):
-    df_mapa = cargar_datos_ecobici()
+df = cargar_datos_ecobici()
 
-# --- BARRA LATERAL (WIDGETS) ---
-st.sidebar.header("Configuración de Vista")
+# --- SIDEBAR: PLANIFICADOR DE RUTA ---
+st.sidebar.header("🗺️ Planificador de Ruta")
 
-# Widget 1: Selección de Estación por ID
-lista_ids = ["Ninguna"] + sorted(df_mapa['ID'].unique().tolist(), key=int)
-id_seleccionada = st.sidebar.selectbox("Selecciona una Estación por ID para resaltar:", lista_ids)
+modo_vista = st.sidebar.radio("Selecciona modo:", ["Mapa General", "Buscar Cercanas"])
 
-# Widget 2: Control de Zoom
-zoom_level = st.sidebar.slider("Ajustar Zoom del Mapa:", min_value=10, max_value=18, value=12)
+if modo_vista == "Buscar Cercanas":
+    st.sidebar.write("### Punto de Referencia")
+    # Coordenadas por defecto (Ángel de la Independencia)
+    ref_lat = st.sidebar.number_input("Latitud Origen", value=19.4298)
+    ref_lon = st.sidebar.number_input("Longitud Origen", value=-99.1676)
+    radio = st.sidebar.slider("Radio de búsqueda (KM)", 0.5, 3.0, 1.5)
+    
+    # Filtrado por radio
+    df['Distancia_Km'] = df.apply(lambda row: calcular_distancia(ref_lat, ref_lon, row['Lat'], row['Lon']), axis=1)
+    df_filtrado = df[df['Distancia_Km'] <= radio].sort_values('Distancia_Km')
+    
+else:
+    df_filtrado = df
 
-# --- LÓGICA DEL MAPA ---
-st.subheader("📍 Mapa de Disponibilidad Normalizada")
+# --- MAPA PRINCIPAL ---
+st.write("# Planificador EcoBici CDMX")
 
-# Base del mapa: Todas las estaciones
+# Crear Mapa
 fig = px.scatter_mapbox(
-    df_mapa, 
-    lat="Latitud", 
-    lon="Longitud", 
-    color="Disponibilidad_%", 
-    size="Capacidad",
-    hover_name="Nombre", 
-    hover_data={"ID": True, "Bicis": True, "Anclajes": True, "Disponibilidad_%": True, "Latitud": False, "Longitud": False},
-    color_continuous_scale="RdYlGn", # Rojo (vacío) a Verde (lleno)
-    range_color=[0, 100],
-    zoom=zoom_level, 
-    height=700
+    df_filtrado, lat="Lat", lon="Lon", color="Disponibilidad_%", 
+    size="Capacidad", hover_name="Nombre",
+    color_continuous_scale="RdYlGn", range_color=[0, 100],
+    zoom=13, height=600
 )
 
-# Resaltar estación seleccionada si aplica
-if id_seleccionada != "Ninguna":
-    estacion_sel = df_mapa[df_mapa['ID'] == id_seleccionada]
-    
-    # Agregamos una capa adicional (trace) para la estación resaltada
+# Si estamos en modo búsqueda, añadir el punto central
+if modo_vista == "Buscar Cercanas":
     fig.add_trace(go.Scattermapbox(
-        lat=estacion_sel["Latitud"],
-        lon=estacion_sel["Longitud"],
-        mode='markers',
-        marker=go.scattermapbox.Marker(
-            size=20,
-            color='gold',
-            symbol='diamond'
-        ),
-        text=estacion_sel['Nombre'],
-        hovertemplate=(
-            f"<b>ESTACIÓN RESALTADA</b><br>" +
-            f"ID: {estacion_sel['ID'].iloc[0]}<br>" +
-            f"Nombre: {estacion_sel['Nombre'].iloc[0]}<br>" +
-            f"Bicis: {estacion_sel['Bicis'].iloc[0]}<br>" +
-            f"Anclajes: {estacion_sel['Anclajes'].iloc[0]}<br>" +
-            "<extra></extra>"
-        )
+        lat=[ref_lat], lon=[ref_lon], mode='markers',
+        marker=go.scattermapbox.Marker(size=15, color='blue', symbol='marker'),
+        name="Tu Ubicación"
     ))
-
-fig.update_layout(mapbox_style="open-street-map")
-fig.update_layout(margin={"r":0,"t":0,"l":0,"b":0})
-
+    
+fig.update_layout(mapbox_style="open-street-map", margin={"r":0,"t":0,"l":0,"b":0})
 st.plotly_chart(fig, use_container_width=True)
 
-# --- MÉTRICAS ---
-col1, col2, col3 = st.columns(3)
-col1.metric("Estaciones Totales", len(df_mapa))
-col2.metric("Bicis en Red", df_mapa['Bicis'].sum())
-col3.metric("Puertos Libres", df_mapa['Anclajes'].sum())
+# --- RUTAS DE GOOGLE MAPS (SIMULADO) ---
+if modo_vista == "Buscar Cercanas":
+    st.subheader("🚶 Estaciones en el radio seleccionado")
+    if not df_filtrado.empty:
+        col_list, col_link = st.columns([2, 1])
+        with col_list:
+            st.dataframe(df_filtrado[['Nombre', 'Bicis', 'Anclajes', 'Distancia_Km']])
+        
+        with col_link:
+            st.info("Para ver la ruta en Google Maps:")
+            # Generar link dinámico
+            destino_nombre = df_filtrado.iloc[0]['Nombre'].replace(" ", "+")
+            url_gmaps = f"https://www.google.com/maps/dir/?api=1&origin={ref_lat},{ref_lon}&destination={df_filtrado.iloc[0]['Lat']},{df_filtrado.iloc[0]['Lon']}&travelmode=walking"
+            st.link_button("Ir a la estación más cercana", url_gmaps)
+    else:
+        st.warning("No se encontraron estaciones en este radio.")
 
-# --- VISUALIZACIÓN DE DATOS AL FINAL ---
-st.divider()
-with st.expander("📊 Ver tabla de datos completa"):
-    st.dataframe(
-        df_mapa.sort_values(by="ID", ascending=True), 
-        use_container_width=True,
-        hide_index=True
-    )
+# --- EXPANDER PARA ALCALDÍAS (EXPLICACIÓN) ---
+with st.expander("ℹ️ Sobre la capa de Alcaldías"):
+    st.write("Para habilitar esta capa, necesitamos un archivo `alcaldias.json`. Una vez que lo tengas en tu repositorio, usaremos `fig.update_layout(mapbox_layers=[...])`.")
