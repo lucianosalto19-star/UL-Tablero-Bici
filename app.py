@@ -5,8 +5,9 @@ import plotly.express as px
 import plotly.graph_objects as go
 import numpy as np
 import json
+from pathlib import Path
 
-# Configuración inicial
+# 1. Configuración de página
 st.set_page_config(page_title="EcoBici Pro CDMX", layout="wide")
 
 # --- FUNCIONES DE SOPORTE ---
@@ -22,40 +23,41 @@ def calcular_distancia(lat1, lon1, lat2, lon2):
 def cargar_datos_ecobici():
     url_info = "https://gbfs.mex.lyftbikes.com/gbfs/en/station_information.json"
     url_status = "https://gbfs.mex.lyftbikes.com/gbfs/en/station_status.json"
-    r1, r2 = requests.get(url_info).json(), requests.get(url_status).json()
-    df1, df2 = pd.DataFrame(r1['data']['stations']), pd.DataFrame(r2['data']['stations'])
+    r1 = requests.get(url_info).json()
+    r2 = requests.get(url_status).json()
+    df1 = pd.DataFrame(r1['data']['stations'])
+    df2 = pd.DataFrame(r2['data']['stations'])
     df = pd.merge(df1[['station_id', 'name', 'lat', 'lon', 'capacity']],
                   df2[['station_id', 'num_bikes_available', 'num_docks_available']], on='station_id')
     df.columns = ['ID', 'Nombre', 'Lat', 'Lon', 'Capacidad', 'Bicis', 'Anclajes']
     df['Disponibilidad_%'] = (df['Bicis'] / df['Capacidad'].replace(0, 1) * 100).round(1)
     return df
 
-# Cargar GeoJSON de CDMX
 def cargar_geojson():
-    with open('09-Cdmx.geojson') as f:
-        return json.load(f)
+    # Buscamos el archivo en la misma carpeta que app.py
+    ruta_geojson = Path(__file__).parent / "09-Cdmx.geojson"
+    try:
+        with open(ruta_geojson, "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception as e:
+        st.warning(f"Capa geográfica no cargada: {e}")
+        return None
 
-# --- INICIO DE APP ---
+# --- CARGA DE DATOS ---
 st.write("# 🚲 EcoBici Pro: Navegador de Ciudad")
 st.caption("Visualización Avanzada | Luciano Salto")
 
 df = cargar_datos_ecobici()
 geojson_data = cargar_geojson()
 
-# --- SIDEBAR: TODOS LOS CONTROLES ---
+# --- SIDEBAR: CONTROLES ---
 st.sidebar.header("🛠️ Panel de Control")
 
-# 1. Filtro de Modo
 modo_vista = st.sidebar.radio("Modo de búsqueda:", ["Ver Todo el Sistema", "Planear Ruta (Radio 1.5km)"])
-
-# 2. Resaltar por ID (Mantenemos funcionalidad previa)
 lista_ids = ["Ninguna"] + sorted(df['ID'].unique().tolist(), key=int)
 id_seleccionada = st.sidebar.selectbox("Resaltar Estación por ID:", lista_ids)
-
-# 3. Control de Zoom (Mantenemos funcionalidad previa)
 zoom_level = st.sidebar.slider("Nivel de Zoom:", 10.0, 18.0, 12.5)
 
-# 4. Lógica de Radio si está en modo Planear
 if modo_vista == "Planear Ruta (Radio 1.5km)":
     st.sidebar.markdown("---")
     st.sidebar.write("📍 **Punto de Referencia**")
@@ -67,7 +69,7 @@ if modo_vista == "Planear Ruta (Radio 1.5km)":
 else:
     df_mapa = df
 
-# --- CONSTRUCCIÓN DEL MAPA ---
+# --- MAPA ---
 fig = px.scatter_mapbox(
     df_mapa, lat="Lat", lon="Lon", 
     color="Disponibilidad_%", size="Capacidad",
@@ -77,19 +79,20 @@ fig = px.scatter_mapbox(
     zoom=zoom_level, height=650
 )
 
-# AÑADIR CAPA GEOJSON (Alcaldías/CPs)
-fig.update_layout(
-    mapbox_layers=[{
-        "sourcetype": "geojson",
-        "source": geojson_data,
-        "type": "line",
-        "color": "gray",
-        "opacity": 0.4,
-        "line": {"width": 1}
-    }]
-)
+# Integrar la capa GeoJSON si existe
+if geojson_data:
+    fig.update_layout(
+        mapbox_layers=[{
+            "sourcetype": "geojson",
+            "source": geojson_data,
+            "type": "line",
+            "color": "#808080",
+            "opacity": 0.5,
+            "line": {"width": 1}
+        }]
+    )
 
-# Resaltar estación seleccionada (Diamante Dorado)
+# Resaltar estación con Diamante
 if id_seleccionada != "Ninguna":
     sel = df[df['ID'] == id_seleccionada]
     fig.add_trace(go.Scattermapbox(
@@ -99,7 +102,7 @@ if id_seleccionada != "Ninguna":
         hovertext=f"ID: {id_seleccionada}<br>{sel['Nombre'].iloc[0]}"
     ))
 
-# Marcador de "Tu ubicación" en modo ruta
+# Marcador de ubicación actual
 if modo_vista == "Planear Ruta (Radio 1.5km)":
     fig.add_trace(go.Scattermapbox(
         lat=[ref_lat], lon=[ref_lon], mode='markers',
@@ -110,13 +113,13 @@ if modo_vista == "Planear Ruta (Radio 1.5km)":
 fig.update_layout(mapbox_style="open-street-map", margin={"r":0,"t":0,"l":0,"b":0})
 st.plotly_chart(fig, use_container_width=True)
 
-# --- BOTÓN DE GOOGLE MAPS ---
+# --- BOTÓN GOOGLE MAPS ---
 if modo_vista == "Planear Ruta (Radio 1.5km)" and not df_mapa.empty:
-    mejor_estacion = df_mapa.iloc[0]
-    st.success(f"Estación más cercana: **{mejor_estacion['Nombre']}** a {mejor_estacion['Distancia_Km']:.2f} km")
-    url_gmaps = f"https://www.google.com/maps/dir/?api=1&origin={ref_lat},{ref_lon}&destination={mejor_estacion['Lat']},{mejor_estacion['Lon']}&travelmode=walking"
+    mejor = df_mapa.iloc[0]
+    st.success(f"Estación más cercana: **{mejor['Nombre']}** a {mejor['Distancia_Km']:.2f} km")
+    url_gmaps = f"https://www.google.com/maps/dir/?api=1&origin={ref_lat},{ref_lon}&destination={mejor['Lat']},{mejor['Lon']}&travelmode=walking"
     st.link_button("🗺️ Abrir ruta en Google Maps", url_gmaps)
 
-# --- VISUALIZACIÓN DE TABLA ---
+# --- TABLA ---
 with st.expander("📊 Explorar Datos en Tabla"):
     st.dataframe(df_mapa, use_container_width=True, hide_index=True)
